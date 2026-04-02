@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# api keys
+.env
+google_vision_api.json
+
+# Virtual environments
+.venv
+
+# directories
+data/
+images/
+models/
+runs/
+backend/upload_img/
+audio/
+unsloth_compiled_cache/
+outputs/
