@@ -19,13 +19,36 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import boxes as box_ops
 
+from datetime import datetime
+from contextlib import nullcontext
+
+from torch.utils.tensorboard import SummaryWriter
+
+from rich.console import Console
+from rich.progress import (
+    Progress,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn,
+    SpinnerColumn,
+)
+
 print('torch:', torch.__version__)
 print('torchvision:', torchvision.__version__)
 print('optuna:', optuna.__version__)
 
+USE_TENSORBOARD = True
+TB_ROOT = Path("runs/fasterrcnn_optuna")
+
+USE_RICH_PROGRESS = True
+RICH_REFRESH_PER_SECOND = 8
+console = Console()
+
 SEED = 42
 AVAILABLE_GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
-MAX_TRAIN_GPUS = 2
+MAX_TRAIN_GPUS = 1
 GPU_COUNT = min(AVAILABLE_GPU_COUNT, MAX_TRAIN_GPUS)
 DEVICE = torch.device('cuda:0' if GPU_COUNT > 0 else 'cpu')
 DATA_PARALLEL_DEVICE_IDS = list(range(GPU_COUNT)) if GPU_COUNT > 1 else []
@@ -74,6 +97,28 @@ VAL_RAW_ROOT = AIHUB_ROOT / '2.Validation'
 EXTRACT_ROOT = Path('data/_extracted_071')
 AUTO_EXTRACT_ZIP = True
 
+def make_run_dir(prefix: str, trial_number: int | None = None):
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if trial_number is None:
+        run_name = f"{prefix}_{timestamp}"
+    else:
+        run_name = f"{prefix}_trial{trial_number:03d}_{timestamp}"
+    run_dir = TB_ROOT / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def format_hparams(backbone, batch_size, learning_rate, weight_decay, epochs):
+    return {
+        "backbone": backbone,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "epochs": epochs,
+        "max_train_gpus": MAX_TRAIN_GPUS,
+        "image_min_size": IMAGE_MIN_SIZE,
+        "image_max_size": IMAGE_MAX_SIZE,
+    }
 
 def _zip_stem(zip_path: Path):
     return zip_path.name[:-4] if zip_path.name.lower().endswith('.zip') else zip_path.stem
@@ -184,7 +229,9 @@ FINAL_EPOCHS = 15
 #        8       │        4        │   ~10 GB        │ ✓ 안전
 #       16       │        8        │   ~20 GB        │ △ 아슬
 #       32       │       16        │   ~40 GB        │ ✗ OOM → 커널 충돌
-BATCH_SIZE_OPTIONS = [10, 12]
+
+
+BATCH_SIZE_OPTIONS = [2, 4]
 
 IMAGE_MIN_SIZE = 640
 IMAGE_MAX_SIZE = 640
@@ -673,62 +720,207 @@ def forward_loss_dict(model, images, targets, device):
     return reduce_loss_dict(loss_dict, model=model)
 
 
-def train_one_epoch(model, data_loader, optimizer, device, epoch):
+def train_one_epoch(model, data_loader, optimizer, device, epoch, writer=None, global_step_start=0):
     model.train()
     running_loss = 0.0
+    last_global_step = global_step_start
 
-    for step, (images, targets) in enumerate(data_loader, start=1):
-        loss_dict = forward_loss_dict(model, images, targets, device)
-        loss = sum(loss_dict.values())
+    progress = None
+    task_id = None
 
-        if not torch.isfinite(loss):
-            raise RuntimeError(f'non-finite loss at epoch={epoch}, step={step}: {loss_dict}')
+    if USE_RICH_PROGRESS:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Train[/bold cyan] epoch {task.fields[epoch]}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("loss={task.fields[loss]}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=RICH_REFRESH_PER_SECOND,
+            transient=True,
+        )
+        progress.start()
+        task_id = progress.add_task(
+            "train",
+            total=len(data_loader),
+            epoch=f"{epoch:02d}",
+            loss="-.----",
+        )
 
-        optimizer.zero_grad(set_to_none=True)  # grad 버퍼를 None으로 해제 → 메모리 절약
-        loss.backward()
-        optimizer.step()
+    try:
+        for step, (images, targets) in enumerate(data_loader, start=1):
+            loss_dict = forward_loss_dict(model, images, targets, device)
+            loss = sum(loss_dict.values())
 
-        running_loss += float(loss.item())
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite loss at epoch={epoch}, step={step}: {loss_dict}")
 
-        if step % 10 == 0 or step == len(data_loader):
-            print(f'[epoch {epoch:02d}] step {step:04d}/{len(data_loader):04d} loss={loss.item():.4f}')
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-    return running_loss / max(len(data_loader), 1)
+            loss_value = float(loss.item())
+            running_loss += loss_value
+            global_step = global_step_start + step
+            last_global_step = global_step
+
+            if writer is not None:
+                writer.add_scalar("train/step_loss", loss_value, global_step)
+                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+
+                for loss_name, loss_tensor in loss_dict.items():
+                    if isinstance(loss_tensor, torch.Tensor):
+                        writer.add_scalar(
+                            f"train_step_components/{loss_name}",
+                            float(loss_tensor.detach().item()),
+                            global_step,
+                        )
+
+            if progress is not None:
+                progress.update(task_id, advance=1, loss=f"{loss_value:.4f}")
+            elif step % 10 == 0 or step == len(data_loader):
+                print(f"[epoch {epoch:02d}] step {step:04d}/{len(data_loader):04d} loss={loss_value:.4f}")
+
+        avg_loss = running_loss / max(len(data_loader), 1)
+        return avg_loss, last_global_step
+
+    finally:
+        if progress is not None:
+            progress.stop()
 
 
 def evaluate_val_loss(model, data_loader, device):
-    model.train()
+    model.train()  # torchvision detection 모델은 loss 계산 시 train mode 필요
     total_loss = 0.0
-    with torch.no_grad():
-        for images, targets in data_loader:
-            loss_dict = forward_loss_dict(model, images, targets, device)
-            loss = sum(loss_dict.values())
-            total_loss += float(loss.item())
-    return total_loss / max(len(data_loader), 1)
+    component_sums = {}
+
+    progress = None
+    task_id = None
+
+    if USE_RICH_PROGRESS:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold magenta]Valid[/bold magenta]"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TextColumn("loss={task.fields[loss]}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=RICH_REFRESH_PER_SECOND,
+            transient=True,
+        )
+        progress.start()
+        task_id = progress.add_task("valid", total=len(data_loader), loss="-.----")
+
+    try:
+        with torch.no_grad():
+            for step, (images, targets) in enumerate(data_loader, start=1):
+                loss_dict = forward_loss_dict(model, images, targets, device)
+                loss = sum(loss_dict.values())
+                loss_value = float(loss.item())
+                total_loss += loss_value
+
+                for loss_name, loss_tensor in loss_dict.items():
+                    component_sums.setdefault(loss_name, 0.0)
+                    component_sums[loss_name] += float(loss_tensor.detach().item())
+
+                if progress is not None:
+                    progress.update(task_id, advance=1, loss=f"{loss_value:.4f}")
+
+        avg_total = total_loss / max(len(data_loader), 1)
+        avg_components = {
+            loss_name: loss_sum / max(len(data_loader), 1)
+            for loss_name, loss_sum in component_sums.items()
+        }
+        return avg_total, avg_components
+
+    finally:
+        if progress is not None:
+            progress.stop()
 
 
-def run_training(model, train_loader, val_loader, optimizer, scheduler, device, epochs, trial=None):
+def run_training(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    scheduler,
+    device,
+    epochs,
+    trial=None,
+    writer=None,
+    hparams=None,
+):
     history = []
     best_state = None
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
+    global_step = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
-        val_loss = evaluate_val_loss(model, val_loader, device)
+        train_loss, global_step = train_one_epoch(
+            model=model,
+            data_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            writer=writer,
+            global_step_start=global_step,
+        )
+
+        val_loss, val_components = evaluate_val_loss(
+            model=model,
+            data_loader=val_loader,
+            device=device,
+        )
+
         if scheduler is not None:
             scheduler.step()
 
-        history.append({'epoch': epoch, 'train_loss': train_loss, 'val_loss': val_loss})
-        print(f'[epoch {epoch:02d}] train={train_loss:.4f} val={val_loss:.4f}')
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": current_lr,
+                **{f"val_{k}": v for k, v in val_components.items()},
+            }
+        )
+
+        print(
+            f"[epoch {epoch:02d}] "
+            f"train={train_loss:.4f} "
+            f"val={val_loss:.4f} "
+            f"lr={current_lr:.6e}"
+        )
+
+        if writer is not None:
+            writer.add_scalar("epoch/train_loss", train_loss, epoch)
+            writer.add_scalar("epoch/val_loss", val_loss, epoch)
+            writer.add_scalar("epoch/lr", current_lr, epoch)
+
+            for loss_name, loss_value in val_components.items():
+                writer.add_scalar(f"val_components/{loss_name}", loss_value, epoch)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = model_state_dict_cpu(model)
 
+            if writer is not None:
+                writer.add_scalar("best/val_loss", best_val_loss, epoch)
+
         if trial is not None:
-            trial.report(best_val_loss, step=epoch)
+            trial.report(val_loss, step=epoch)
             if trial.should_prune():
                 raise optuna.TrialPruned()
+
+    if writer is not None and hparams is not None:
+        metric_dict = {"hparam/best_val_loss": best_val_loss}
+        writer.add_hparams(hparams, metric_dict)
 
     return history, best_state, best_val_loss
 
@@ -795,10 +987,10 @@ print('smoke test passed:', smoke_test_result)
 
 
 def objective(trial):
-    backbone = trial.suggest_categorical('backbone', SEARCH_BACKBONES)
-    batch_size = trial.suggest_categorical('batch_size', BATCH_SIZE_OPTIONS)
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 5e-4, log=True)
-    weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-3, log=True)
+    backbone = trial.suggest_categorical("backbone", SEARCH_BACKBONES)
+    batch_size = trial.suggest_categorical("batch_size", BATCH_SIZE_OPTIONS)
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
 
     model = build_training_model(backbone, num_classes=num_classes, device=DEVICE)
     train_loader, val_loader = make_loaders(train_dataset, val_dataset, batch_size=batch_size)
@@ -806,7 +998,25 @@ def objective(trial):
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SEARCH_EPOCHS)
 
+    writer = None
+    run_dir = None
+
+    hparams = format_hparams(
+        backbone=backbone,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        epochs=SEARCH_EPOCHS,
+    )
+
     try:
+        if USE_TENSORBOARD:
+            run_dir = make_run_dir(prefix="optuna", trial_number=trial.number)
+            writer = SummaryWriter(log_dir=str(run_dir))
+            writer.add_text("meta/device", str(DEVICE))
+            writer.add_text("meta/run_dir", str(run_dir))
+            writer.add_text("meta/per_step_split", str(describe_batch_split(batch_size)))
+
         _, _, best_val_loss = run_training(
             model=model,
             train_loader=train_loader,
@@ -816,14 +1026,25 @@ def objective(trial):
             device=DEVICE,
             epochs=SEARCH_EPOCHS,
             trial=trial,
+            writer=writer,
+            hparams=hparams,
         )
+
+        if writer is not None:
+            writer.flush()
+
         return best_val_loss
+
     finally:
+        if writer is not None:
+            writer.close()
+
         del model
         del optimizer
         del scheduler
         del train_loader
         del val_loader
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -901,6 +1122,21 @@ study = _create_study_safe(
 )
 
 study.optimize(objective, n_trials=SEARCH_TRIALS, show_progress_bar=True)
+
+best_tb_dir = make_run_dir(prefix="study_summary")
+best_writer = SummaryWriter(log_dir=str(best_tb_dir))
+
+best_writer.add_text("study/best_params", str(study.best_trial.params))
+best_writer.add_scalar("study/best_value", float(study.best_value), 0)
+
+for key, value in study.best_trial.params.items():
+    if isinstance(value, (int, float)):
+        best_writer.add_scalar(f"study_best_params/{key}", value, 0)
+    else:
+        best_writer.add_text(f"study_best_params/{key}", str(value))
+
+best_writer.flush()
+best_writer.close()
 
 print('best value:', study.best_value)
 print('best params:', study.best_trial.params)
