@@ -149,8 +149,8 @@ def _extract_zip_once(zip_path: Path, out_dir: Path):
 
 
 def extract_split_archives(split_raw_root: Path, split_name: str):
-    label_zip_root = split_raw_root / '라벨링데이터' / '04.딸기'
-    image_zip_root = split_raw_root / '원천데이터' / '04.딸기'
+    label_zip_root = split_raw_root / '라벨링데이터' / '05.상추'
+    image_zip_root = split_raw_root / '원천데이터' / '05.상추'
 
     if not label_zip_root.exists() or not image_zip_root.exists():
         raise FileNotFoundError(f'압축 폴더를 찾을 수 없습니다: {split_raw_root}')
@@ -203,8 +203,8 @@ TRAIN_SOURCES, VAL_SOURCES = build_sources(auto_extract=AUTO_EXTRACT_ZIP)
 # disease id -> display name. 비워두면 disease_숫자 형태로 자동 생성됩니다.
 CLASS_NAME_BY_DISEASE = {
     0: 'normal',
-    7: 'gray_mold',
-    8: 'powdery_mildew'
+    9: 'sclerotinia_rot',
+    10: 'downy_mildew'
 }
 
 # =========================
@@ -213,10 +213,18 @@ CLASS_NAME_BY_DISEASE = {
 # 탐색할 백본 목록
 # - resnet50       : 안정적인 기준선, FPN 내장 pretrained 가중치 제공
 # - convnext_small : RTX 4090에서 ResNet50보다 TF32 가속 효율이 높고 정확도도 우수
-SEARCH_BACKBONES = ['resnet50', 'convnext_small']
-SEARCH_TRIALS = 12
+SEARCH_BACKBONES = ['convnext_small']
+SEARCH_TRIALS = 3
 SEARCH_EPOCHS = 3
-FINAL_EPOCHS = 15
+FINAL_EPOCHS = 5
+
+# ConvNeXt features 인덱스 (tiny/small 공통, 총 8개):
+#   0: Stem (4.9K)    1: Stage1-3×CNBlock-96ch (238K)
+#   2: DS 96→192 (74K) 3: Stage2-3×CNBlock-192ch (918K)
+#   4: DS 192→384 (296K) 5: Stage3-27×CNBlock-384ch (32.5M) ← 전체의 66%
+#   6: DS 384→768 (1.2M) 7: Stage4-3×CNBlock-768ch (14.3M)
+# 앞단을 freeze하면 backward 계산량이 크게 줄어 학습이 빨라집니다.
+FREEZE_BACKBONE_STAGES = [0, 1, 2, 3, 4, 5]  # Stem ~ Stage3 freeze (68.7%)
 
 # ─── 배치 크기 선택 가이드 (FasterRCNN + 640×640, RTX 4090 24 GB 기준) ───
 # FasterRCNN은 RPN proposals + RoI 풀링 때문에 일반 분류 모델보다 VRAM 소모가 큽니다.
@@ -231,13 +239,13 @@ FINAL_EPOCHS = 15
 #       32       │       16        │   ~40 GB        │ ✗ OOM → 커널 충돌
 
 
-BATCH_SIZE_OPTIONS = [2, 4]
+BATCH_SIZE_OPTIONS = [6]
 
 IMAGE_MIN_SIZE = 640
 IMAGE_MAX_SIZE = 640
 USE_PRETRAINED_WEIGHTS = True
 
-STUDY_NAME = 'strawberry_detection_optuna'
+STUDY_NAME = 'lettuce_detection_optuna'
 OUTPUT_DIR = Path('runs') / STUDY_NAME
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 STUDY_DB_PATH = OUTPUT_DIR / 'optuna_study.db'
@@ -542,12 +550,18 @@ def build_convnext_fasterrcnn(num_classes: int, variant: str = 'small'):
         따라서 AnchorGenerator의 sizes/aspect_ratios도 반드시 4개여야 합니다.
         (5개로 설정하면 AssertionError: match between feature maps and sizes 발생)
 
-        ConvNeXt features 인덱스 구조 (tiny/small 공통):
-          0: Stem       1: Stage1   2: Stage2(C2)
-          3: Downsample 4: Stage3(C3)
-          5: Downsample 6: Stage4(C4)
-        return_layers = {'2': '0', '4': '1', '6': '2'}
+        ConvNeXt features 인덱스 구조 (tiny/small 공통, 총 8개):
+          0: Stem(96ch)         1: Stage1(96ch, 3×CNBlock)
+          2: DS(96→192)         3: Stage2(192ch, 3×CNBlock)
+          4: DS(192→384)        5: Stage3(384ch, 27×CNBlock)
+          6: DS(384→768)        7: Stage4(768ch, 3×CNBlock)
+
+        return_layers = {'3': '0', '5': '1', '7': '2'}  (stage 출력 캐프쳐)
         in_channels = [192, 384, 768]
+
+        FREEZE_BACKBONE_STAGES = [0..5] 설정 시:
+          → Stage4 + DS(6) + FPN + Head만 학습 (trainable ~31%)
+          → backward 계산량 대폭 감소 → fine-tuning 속도 향상
     """
     from torchvision.models import convnext_tiny, convnext_small
     from torchvision.models.detection.backbone_utils import BackboneWithFPN
@@ -572,10 +586,16 @@ def build_convnext_fasterrcnn(num_classes: int, variant: str = 'small'):
         fallback_builder=fallback_builder,
     )
 
+    # Freeze early stages for faster fine-tuning
+    for stage_idx in FREEZE_BACKBONE_STAGES:
+        for param in backbone_body[stage_idx].parameters():
+            param.requires_grad = False
+
     # BackboneWithFPN: return_layers 3개 + LastLevelMaxPool → 출력 4개 ('0','1','2','pool')
+    # Stage 출력을 캐프쳐 (Downsample 출력 대신 더 풍부한 feature)
     backbone = BackboneWithFPN(
         backbone=backbone_body,
-        return_layers={'2': '0', '4': '1', '6': '2'},
+        return_layers={'3': '0', '5': '1', '7': '2'},
         in_channels_list=[192, 384, 768],
         out_channels=256,
     )
@@ -650,6 +670,10 @@ def describe_batch_split(batch_size: int):
 
 def build_training_model(backbone_name: str, num_classes: int, device: torch.device):
     model = build_model(backbone_name, num_classes=num_classes).to(device)
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    print(f'params — total: {total:,} | trainable: {trainable:,} | frozen: {frozen:,} ({frozen/total*100:.1f}%)')
     if USE_DATA_PARALLEL:
         print(f'using DataParallel on GPUs: {DATA_PARALLEL_DEVICE_IDS}')
         model = DetectionDataParallel(model, device_ids=DATA_PARALLEL_DEVICE_IDS)
@@ -931,7 +955,8 @@ def smoke_test_training_step(backbone_name, dataset, num_classes, batch_size, de
         raise ValueError('dataset is empty, so smoke test cannot run.')
 
     model = build_training_model(backbone_name, num_classes=num_classes, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-5, weight_decay=1e-4)
 
     batch = [dataset[idx] for idx in range(sample_count)]
     images, targets = collate_fn(batch)
@@ -995,7 +1020,8 @@ def objective(trial):
     model = build_training_model(backbone, num_classes=num_classes, device=DEVICE)
     train_loader, val_loader = make_loaders(train_dataset, val_dataset, batch_size=batch_size)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=SEARCH_EPOCHS)
 
     writer = None
@@ -1158,7 +1184,7 @@ final_train_loader, final_val_loader = make_loaders(
 )
 
 final_optimizer = torch.optim.AdamW(
-    final_model.parameters(),
+    [p for p in final_model.parameters() if p.requires_grad],
     lr=best_params['learning_rate'],
     weight_decay=best_params['weight_decay'],
 )
